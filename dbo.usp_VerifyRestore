@@ -1,0 +1,304 @@
+
+-------------------------------------------------------------------------------
+-- 1. The harness procedure
+-------------------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE dbo.usp_VerifyRestore
+    @DatabaseName SYSNAME,
+    @Execute      BIT = 0,           -- 0 = dry run (print plan), 1 = actually run
+    @IConfirmThisIsARestoreInstance BIT = 0  -- must be 1 to execute a real restore
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    -- ─────────────────────────────────────────────────────────────────────
+    -- SAFETY GUARD: never restore onto the production instance by accident.
+    -- A real restore (@Execute = 1) requires you to explicitly confirm this is a dedicated restore/verification instance. Optionally, hard-restrict to an allow-list of approved servers below.
+    -- ─────────────────────────────────────────────────────────────────────
+    IF @Execute = 1 AND @IConfirmThisIsARestoreInstance = 0
+    BEGIN
+        RAISERROR(
+          'Refusing to run: this restores databases onto the CURRENT instance (%s). Run only on a dedicated restore/verification server, never production. Pass @IConfirmThisIsARestoreInstance = 1 to proceed.',
+          16, 1, @@SERVERNAME);
+        RETURN;
+    END;
+
+    -- OPTIONAL hard allow-list — uncomment and list your approved restore hosts:
+    -- IF @Execute = 1 AND @@SERVERNAME NOT IN (N'RESTORE01', N'DRVERIFY01')
+    -- BEGIN
+    --     RAISERROR('Instance %s is not an approved restore host. Aborting.',
+    --               16, 1, @@SERVERNAME);
+    --     RETURN;
+    -- END;
+
+    DECLARE @cfgRTO INT, @dataPath NVARCHAR(260), @logPath NVARCHAR(260),
+            @runCheck BIT, @enabled BIT, @linkedSrv SYSNAME, @srcServer SYSNAME;
+
+    SELECT @cfgRTO = RTOTargetSeconds, @dataPath = RestoreDataPath,
+           @logPath = RestoreLogPath, @runCheck = RunCheckDB, @enabled = IsEnabled,
+           @linkedSrv = SourceLinkedServer, @srcServer = SourceServer
+    FROM dbo.RestoreVerifyConfig
+    WHERE DatabaseName = @DatabaseName;
+
+    IF @cfgRTO IS NULL
+    BEGIN
+        RAISERROR('Database "%s" is not registered in dbo.RestoreVerifyConfig.',
+                  16, 1, @DatabaseName);
+        RETURN;
+    END;
+    IF @enabled = 0
+    BEGIN
+        PRINT 'Skipping "' + @DatabaseName + '" — disabled in config.';
+        RETURN;
+    END;
+    IF @linkedSrv IS NULL OR NOT EXISTS
+        (SELECT 1 FROM sys.servers WHERE name = @linkedSrv AND is_linked = 1)
+    BEGIN
+        RAISERROR('SourceLinkedServer "%s" for database "%s" is not a valid linked server on this instance. Create the linked server to the production instance first.', 16, 1, @linkedSrv, @DatabaseName);
+        RETURN;
+    END;
+
+    DECLARE @tempName SYSNAME = N'RVTEST_' + @DatabaseName + N'_'
+                              + CONVERT(NVARCHAR(8), GETDATE(), 112);
+
+    -- SAFETY: never overwrite an existing database
+    IF DB_ID(@tempName) IS NOT NULL
+    BEGIN
+        RAISERROR('Target restore name "%s" already exists. Aborting for safety.',
+                  16, 1, @tempName);
+        RETURN;
+    END;
+
+    ---------------------------------------------------------------------------
+    -- 1a. Build the restore chain from the SOURCE instance's msdb (linked server)
+    --     History lives on production; we read it remotely, restore locally.
+    ---------------------------------------------------------------------------
+    DECLARE @fullPath NVARCHAR(260), @fullFinish DATETIME;
+    DECLARE @histSql NVARCHAR(MAX);
+    DECLARE @qLink SYSNAME = QUOTENAME(@linkedSrv);
+
+    -- latest FULL
+    SET @histSql = N'
+        SELECT TOP 1
+            @fPath   = bmf.physical_device_name,
+            @fFinish = bs.backup_finish_date
+        FROM ' + @qLink + N'.msdb.dbo.backupset bs
+        JOIN ' + @qLink + N'.msdb.dbo.backupmediafamily bmf
+             ON bmf.media_set_id = bs.media_set_id
+        WHERE bs.database_name = @db AND bs.type = ''D''
+        ORDER BY bs.backup_finish_date DESC;';
+    EXEC sp_executesql @histSql,
+         N'@db SYSNAME, @fPath NVARCHAR(260) OUTPUT, @fFinish DATETIME OUTPUT',
+         @db = @DatabaseName, @fPath = @fullPath OUTPUT, @fFinish = @fullFinish OUTPUT;
+
+    IF @fullPath IS NULL
+    BEGIN
+        RAISERROR('No FULL backup found in %s''s history for "%s".',
+                  16, 1, @linkedSrv, @DatabaseName);
+        RETURN;
+    END;
+    -- rewrite the recorded (possibly local) path to one the restore box can read
+    SET @fullPath = dbo.fn_RewriteBackupPath(@srcServer, @fullPath);
+
+    -- Sanity check: if the (rewritten) path still looks like a local drive path
+    -- (e.g. 'E:\...') it almost certainly won't be reachable from this instance.
+    -- Fail early with a clear message instead of a cryptic 'cannot find file'.
+    IF @fullPath LIKE '[A-Za-z]:\%'
+    BEGIN
+        RAISERROR('Backup path "%s" looks local to %s and has no path mapping. Add a dbo.RestoreVerifyPathMap row translating that server''s local backup folder to a UNC share this instance can read.',
+                  16, 1, @fullPath, @srcServer);
+        RETURN;
+    END;
+
+    -- latest DIFF taken after that full (optional)
+    DECLARE @diffPath NVARCHAR(260), @diffFinish DATETIME;
+    SET @histSql = N'
+        SELECT TOP 1
+            @dPath   = bmf.physical_device_name,
+            @dFinish = bs.backup_finish_date
+        FROM ' + @qLink + N'.msdb.dbo.backupset bs
+        JOIN ' + @qLink + N'.msdb.dbo.backupmediafamily bmf
+             ON bmf.media_set_id = bs.media_set_id
+        WHERE bs.database_name = @db AND bs.type = ''I''
+          AND bs.backup_finish_date > @fFinish
+        ORDER BY bs.backup_finish_date DESC;';
+    EXEC sp_executesql @histSql,
+         N'@db SYSNAME, @fFinish DATETIME, @dPath NVARCHAR(260) OUTPUT, @dFinish DATETIME OUTPUT',
+         @db = @DatabaseName, @fFinish = @fullFinish,
+         @dPath = @diffPath OUTPUT, @dFinish = @diffFinish OUTPUT;
+
+    IF @diffPath IS NOT NULL
+        SET @diffPath = dbo.fn_RewriteBackupPath(@srcServer, @diffPath);
+
+    DECLARE @chainStart DATETIME = COALESCE(@diffFinish, @fullFinish);
+
+    ---------------------------------------------------------------------------
+    -- 1b. Get logical file list from the full backup for MOVE clauses.
+    --     FILELISTONLY reads the backup FILE directly (over the shared path), so this runs LOCALLY — no linked server needed here. The path came from production's history but the file itself must be reachable here.
+    ---------------------------------------------------------------------------
+    DECLARE @fileList TABLE
+    (
+        LogicalName SYSNAME, PhysicalName NVARCHAR(260), Type CHAR(1),
+        FileGroupName SYSNAME NULL, Size NUMERIC(20,0), MaxSize NUMERIC(20,0),
+        FileId INT, CreateLSN NUMERIC(25,0), DropLSN NUMERIC(25,0) NULL,
+        UniqueId UNIQUEIDENTIFIER, ReadOnlyLSN NUMERIC(25,0) NULL,
+        ReadWriteLSN NUMERIC(25,0) NULL, BackupSizeInBytes BIGINT,
+        SourceBlockSize INT, FileGroupId INT, LogGroupGUID UNIQUEIDENTIFIER NULL,
+        DifferentialBaseLSN NUMERIC(25,0) NULL, DifferentialBaseGUID UNIQUEIDENTIFIER NULL,
+        IsReadOnly BIT, IsPresent BIT, TDEThumbprint VARBINARY(32) NULL,
+        SnapshotURL NVARCHAR(360) NULL
+    );
+    DECLARE @sql NVARCHAR(MAX) =
+        N'RESTORE FILELISTONLY FROM DISK = @p';
+    INSERT INTO @fileList
+    EXEC sp_executesql @sql, N'@p NVARCHAR(260)', @p = @fullPath;
+
+    -- Build MOVE clauses redirecting every file to the scratch paths
+    DECLARE @moveClauses NVARCHAR(MAX) = N'';
+    SELECT @moveClauses = @moveClauses
+        + N'    MOVE ' + QUOTENAME(LogicalName, '''') + N' TO '
+        + QUOTENAME(
+            CASE WHEN Type = 'L'
+                 THEN @logPath + @tempName + N'_' + LogicalName + N'.ldf'
+                 ELSE @dataPath + @tempName + N'_' + LogicalName + N'.mdf'
+            END, '''') + N',' + CHAR(13) + CHAR(10)
+    FROM @fileList
+    WHERE IsPresent = 1;
+
+    ---------------------------------------------------------------------------
+    -- 1c. Assemble the RESTORE statements
+    ---------------------------------------------------------------------------
+    DECLARE @restoreSql NVARCHAR(MAX);
+    DECLARE @backupsUsed INT = 1;
+
+    -- FULL, leave NORECOVERY so we can apply diff/logs
+    SET @restoreSql =
+        N'RESTORE DATABASE ' + QUOTENAME(@tempName) + N' FROM DISK = '
+        + QUOTENAME(@fullPath, '''') + N' WITH ' + CHAR(13) + CHAR(10)
+        + @moveClauses
+        + N'    REPLACE, NORECOVERY, STATS = 5;' + CHAR(13) + CHAR(10);
+
+    -- DIFF (if present)
+    IF @diffPath IS NOT NULL
+    BEGIN
+        SET @restoreSql = @restoreSql
+            + N'RESTORE DATABASE ' + QUOTENAME(@tempName) + N' FROM DISK = '
+            + QUOTENAME(@diffPath, '''') + N' WITH NORECOVERY;'
+            + CHAR(13) + CHAR(10);
+        SET @backupsUsed += 1;
+    END;
+
+    -- LOGs taken after the chain start, in order, from the SOURCE msdb.
+    -- NOTE: this filters logs by backup_finish_date for simplicity. For edge cases where a log backup straddles the diff's finish time, the strictly correct filter is by LSN (restore stops at the right point regardless, but selecting by LSN avoids applying one unnecessary leading log).
+    DECLARE @logs TABLE (seq INT IDENTITY(1,1), physical_device_name NVARCHAR(260));
+    SET @histSql = N'
+        SELECT bmf.physical_device_name
+        FROM ' + @qLink + N'.msdb.dbo.backupset bs
+        JOIN ' + @qLink + N'.msdb.dbo.backupmediafamily bmf
+             ON bmf.media_set_id = bs.media_set_id
+        WHERE bs.database_name = @db AND bs.type = ''L''
+          AND bs.backup_finish_date > @cs
+        ORDER BY bs.backup_finish_date ASC;';
+    INSERT INTO @logs (physical_device_name)
+    EXEC sp_executesql @histSql,
+         N'@db SYSNAME, @cs DATETIME', @db = @DatabaseName, @cs = @chainStart;
+
+    DECLARE @logPathFile NVARCHAR(260), @logSeq INT = 1, @maxLog INT;
+    SELECT @maxLog = MAX(seq) FROM @logs;
+    WHILE @logSeq <= ISNULL(@maxLog, 0)
+    BEGIN
+        SELECT @logPathFile = physical_device_name FROM @logs WHERE seq = @logSeq;
+        SET @logPathFile = dbo.fn_RewriteBackupPath(@srcServer, @logPathFile);
+        SET @restoreSql = @restoreSql
+            + N'RESTORE LOG ' + QUOTENAME(@tempName) + N' FROM DISK = '
+            + QUOTENAME(@logPathFile, '''') + N' WITH NORECOVERY;'
+            + CHAR(13) + CHAR(10);
+        SET @backupsUsed += 1;
+        SET @logSeq += 1;
+    END;
+
+    -- Final: bring the copy online
+    SET @restoreSql = @restoreSql
+        + N'RESTORE DATABASE ' + QUOTENAME(@tempName) + N' WITH RECOVERY;'
+        + CHAR(13) + CHAR(10);
+
+    ---------------------------------------------------------------------------
+    -- 1d. Dry run — just show the plan
+    ---------------------------------------------------------------------------
+    IF @Execute = 0
+    BEGIN
+        PRINT '─────────────────────────────────────────────────────────────';
+        PRINT ' DRY RUN for [' + @DatabaseName + ']  (set @Execute = 1 to run)';
+        PRINT '   Temp name : ' + @tempName;
+        PRINT '   Backups   : ' + CAST(@backupsUsed AS VARCHAR(10)) + ' file(s)';
+        PRINT '   RTO target: ' + CAST(@cfgRTO AS VARCHAR(10)) + ' s';
+        PRINT '─────────────────────────────────────────────────────────────';
+        PRINT @restoreSql;
+        RETURN;
+    END;
+
+    ---------------------------------------------------------------------------
+    -- 1e. Execute: restore, CHECKDB, time it, log it, clean up
+    ---------------------------------------------------------------------------
+    DECLARE @start DATETIME2 = SYSUTCDATETIME();
+    DECLARE @ok BIT = 0, @checkOk BIT = NULL, @err NVARCHAR(2000) = NULL,
+            @secs INT = NULL;
+
+    BEGIN TRY
+        EXEC sp_executesql @restoreSql;
+        SET @secs = DATEDIFF(SECOND, @start, SYSUTCDATETIME());
+        SET @ok = 1;
+
+        IF @runCheck = 1
+        BEGIN
+            BEGIN TRY
+                DECLARE @check NVARCHAR(MAX) =
+                    N'DBCC CHECKDB(' + QUOTENAME(@tempName, '''')
+                    + N') WITH NO_INFOMSGS, ALL_ERRORMSGS;';
+                EXEC sp_executesql @check;
+                SET @checkOk = 1;   -- CHECKDB raises an error on corruption
+            END TRY
+            BEGIN CATCH
+                SET @checkOk = 0;
+                SET @err = N'CHECKDB: ' + ERROR_MESSAGE();
+            END CATCH;
+        END;
+    END TRY
+    BEGIN CATCH
+        SET @ok = 0;
+        SET @err = N'RESTORE: ' + ERROR_MESSAGE();
+    END CATCH;
+
+    -- Log the outcome (this row is what dr-drift-monitor consumes)
+    INSERT INTO dbo.RestoreVerifyLog
+        (DatabaseName, RestoreSeconds, Succeeded, CheckDBPassed,
+         RTOTargetSeconds, BackupsUsed, ErrorMessage)
+    VALUES
+        (@DatabaseName, @secs, @ok, @checkOk, @cfgRTO, @backupsUsed, @err);
+
+    -- Clean up the temp copy no matter what
+    IF DB_ID(@tempName) IS NOT NULL
+    BEGIN
+        DECLARE @drop NVARCHAR(MAX) =
+            N'ALTER DATABASE ' + QUOTENAME(@tempName)
+          + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE; '
+          + N'DROP DATABASE ' + QUOTENAME(@tempName) + N';';
+        BEGIN TRY EXEC sp_executesql @drop; END TRY
+        BEGIN CATCH
+            PRINT 'WARNING: could not drop temp DB ' + @tempName
+                + ' — ' + ERROR_MESSAGE();
+        END CATCH;
+    END;
+
+    -- Report
+    PRINT 'Verify [' + @DatabaseName + ']: '
+        + CASE WHEN @ok = 1 THEN 'RESTORED ok in '
+                 + CAST(@secs AS VARCHAR(10)) + 's'
+               ELSE 'FAILED' END
+        + CASE WHEN @checkOk = 1 THEN ', CHECKDB clean'
+               WHEN @checkOk = 0 THEN ', CHECKDB FAILED'
+               ELSE '' END
+        + CASE WHEN @ok = 1 AND @secs > @cfgRTO
+               THEN '  ** RTO BREACH **' ELSE '' END;
+END;
+GO
