@@ -1,0 +1,20 @@
+IF OBJECT_ID('dbo.RestoreVerifyLog') IS NULL
+BEGIN
+    CREATE TABLE dbo.RestoreVerifyLog
+    (
+        VerifyID         BIGINT IDENTITY(1,1) PRIMARY KEY,
+        DatabaseName     SYSNAME      NOT NULL,
+        TestDate         DATETIME2(0) NOT NULL DEFAULT SYSUTCDATETIME(),
+        RestoreSeconds   INT          NULL,
+        Succeeded        BIT          NOT NULL DEFAULT 0,
+        CheckDBPassed    BIT          NULL,
+        RTOTargetSeconds INT          NULL,
+        RTOBreached      AS (CASE WHEN RestoreSeconds > RTOTargetSeconds
+                                  THEN 1 ELSE 0 END) PERSISTED,
+        BackupsUsed      INT          NULL,      -- # of backup files applied
+        ErrorMessage     NVARCHAR(2000) NULL
+    );
+    CREATE INDEX IX_RVLog_DB_Date
+        ON dbo.RestoreVerifyLog (DatabaseName, TestDate);
+END;
+GO
