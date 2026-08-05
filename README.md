@@ -13,7 +13,6 @@ This is a pure T-SQL harness that automatically proves your backups are restorab
 5. Logs the outcome — success/fail, duration, CHECKDB result, RTO breach.
 6. Drops the temp copy to reclaim space.
 
-No Python, no external tools, no dependencies. One `.sql` file.
 
 ## Safety first — read before running
 
