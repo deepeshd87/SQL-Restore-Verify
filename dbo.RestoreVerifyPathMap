@@ -1,0 +1,14 @@
+-- Path rewrite map: translate a source server's LOCAL backup paths into network paths the restore instance can read. The framework does NOT guess share names — YOU supply the mapping. Longest matching prefix wins, so you can have several
+-- rules per server (e.g. E:\Backups and F:\Backups mapping to different shares).
+IF OBJECT_ID('dbo.RestoreVerifyPathMap') IS NULL
+BEGIN
+    CREATE TABLE dbo.RestoreVerifyPathMap
+    (
+        PathMapID    INT IDENTITY(1,1) PRIMARY KEY,
+        SourceServer SYSNAME       NOT NULL,   -- matches RestoreVerifyConfig.SourceServer
+        LocalPrefix  NVARCHAR(260) NOT NULL,   -- e.g. N'E:\Backups\'
+        NetworkPrefix NVARCHAR(260) NOT NULL,  -- e.g. N'\\PRODSQL01\Backups\'
+        CONSTRAINT UQ_PathMap UNIQUE (SourceServer, LocalPrefix)
+    );
+END;
+GO
