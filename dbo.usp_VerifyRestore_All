@@ -1,0 +1,29 @@
+-------------------------------------------------------------------------------
+-- 2. Driver: verify every enabled database
+-------------------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE dbo.usp_VerifyRestore_All
+    @Execute BIT = 0,
+    @IConfirmThisIsARestoreInstance BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @db SYSNAME;
+    DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DatabaseName FROM dbo.RestoreVerifyConfig
+        WHERE IsEnabled = 1 ORDER BY DatabaseName;
+    OPEN c;
+    FETCH NEXT FROM c INTO @db;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRY
+            EXEC dbo.usp_VerifyRestore @db, @Execute,
+                 @IConfirmThisIsARestoreInstance;
+        END TRY
+        BEGIN CATCH
+            PRINT 'ERROR verifying ' + @db + ': ' + ERROR_MESSAGE();
+        END CATCH;
+        FETCH NEXT FROM c INTO @db;
+    END;
+    CLOSE c; DEALLOCATE c;
+END;
+GO
