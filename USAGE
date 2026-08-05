@@ -39,4 +39,4 @@
   FROM dbo.RestoreVerifyLog
   ORDER BY TestDate DESC;
 
-  This log is the exact feed dr-drift-monitor's RestoreTestLog expects — this framework PROVES restorability; that one TRENDS it over time.
+  This log is the exact feed Disaster-Recovery-Drift's RestoreTestLog expects — this framework PROVES restorability; that one TRENDS it over time.
