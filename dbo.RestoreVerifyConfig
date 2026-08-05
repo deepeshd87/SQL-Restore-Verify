@@ -1,0 +1,18 @@
+-------------------------------------------------------------------------------
+-- 0. Registration + result tables (one-time setup)
+-------------------------------------------------------------------------------
+IF OBJECT_ID('dbo.RestoreVerifyConfig') IS NULL
+BEGIN
+    CREATE TABLE dbo.RestoreVerifyConfig
+    (
+        DatabaseName      SYSNAME      NOT NULL PRIMARY KEY,
+        SourceServer      SYSNAME      NULL,      -- informational
+        SourceLinkedServer SYSNAME     NOT NULL,  -- linked server to the PROD instance whose msdb has the authoritative backup history
+        RTOTargetSeconds  INT          NOT NULL DEFAULT 1800,
+        RestoreDataPath   NVARCHAR(260) NOT NULL, -- where to put temp .mdf/.ndf
+        RestoreLogPath    NVARCHAR(260) NOT NULL, -- where to put temp .ldf
+        RunCheckDB        BIT          NOT NULL DEFAULT 1,
+        IsEnabled         BIT          NOT NULL DEFAULT 1
+    );
+END;
+GO
