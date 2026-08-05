@@ -1,0 +1,25 @@
+-------------------------------------------------------------------------------
+-- 0b. Path-rewrite helper: translate a recorded backup path to a reachable one. If a mapping row matches the recorded path's prefix for this source server, rewrite it; otherwise return the path unchanged. Longest matching LocalPrefix wins, so more-specific rules take precedence.
+-------------------------------------------------------------------------------
+CREATE OR ALTER FUNCTION dbo.fn_RewriteBackupPath
+(
+    @SourceServer SYSNAME,
+    @RecordedPath NVARCHAR(260)
+)
+RETURNS NVARCHAR(260)
+AS
+BEGIN
+    DECLARE @local NVARCHAR(260), @net NVARCHAR(260);
+
+    SELECT TOP 1 @local = LocalPrefix, @net = NetworkPrefix
+    FROM dbo.RestoreVerifyPathMap
+    WHERE SourceServer = @SourceServer
+      AND LEFT(@RecordedPath, LEN(LocalPrefix)) = LocalPrefix
+    ORDER BY LEN(LocalPrefix) DESC;   -- most specific match first
+
+    IF @local IS NULL
+        RETURN @RecordedPath;         -- no mapping: use as-is (already UNC, etc.)
+
+    RETURN @net + SUBSTRING(@RecordedPath, LEN(@local) + 1, 260);
+END;
+GO
