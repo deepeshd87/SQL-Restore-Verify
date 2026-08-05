@@ -1,0 +1,42 @@
+/*───────────────────────────────────────────────────────────────────────────
+  USAGE
+  -----
+  -- 0. PREREQUISITE: create a linked server on THIS instance pointing at the production instance (one-time, per source server). Example:
+  --    EXEC sp_addlinkedserver @server = N'PRODSQL01',
+  --         @srvproduct = N'', @provider = N'SQLNCLI',
+  --         @datasrc = N'PRODSQL01';
+  --    (configure security/login mapping per your standards; it needs read access to production's msdb backup history)
+
+  -- 1. Register a database. SourceLinkedServer = the linked server above.
+  --    Paths point at THIS instance's scratch drives.
+  INSERT INTO dbo.RestoreVerifyConfig
+      (DatabaseName, SourceServer, SourceLinkedServer, RTOTargetSeconds,
+       RestoreDataPath, RestoreLogPath)
+  VALUES
+      (N'Orders', N'PRODSQL01', N'PRODSQL01', 1800,
+       N'D:\RestoreTest\', N'D:\RestoreTest\');
+
+  -- 1b. If production backs up to LOCAL paths, map them to UNC shares this instance can read. (Skip this if backups already go to a UNC share.)
+  --     Longest LocalPrefix wins, so you can layer general + specific rules.
+  INSERT INTO dbo.RestoreVerifyPathMap (SourceServer, LocalPrefix, NetworkPrefix)
+  VALUES
+      (N'PRODSQL01', N'E:\Backups\', N'\\PRODSQL01\Backups\');
+
+  -- 2. Dry run — inspect the generated RESTORE plan without running it:
+  EXEC dbo.usp_VerifyRestore @DatabaseName = N'Orders', @Execute = 0;
+
+  -- 3. Run it for real (must confirm this is a restore instance, not prod):
+  EXEC dbo.usp_VerifyRestore @DatabaseName = N'Orders', @Execute = 1,
+       @IConfirmThisIsARestoreInstance = 1;
+
+  -- 4. Verify the whole registered set (schedule this on Agent, nightly):
+  EXEC dbo.usp_VerifyRestore_All @Execute = 1,
+       @IConfirmThisIsARestoreInstance = 1;
+
+  -- 5. See your restore-verification history:
+  SELECT DatabaseName, TestDate, Succeeded, CheckDBPassed,
+         RestoreSeconds, RTOTargetSeconds, RTOBreached, ErrorMessage
+  FROM dbo.RestoreVerifyLog
+  ORDER BY TestDate DESC;
+
+  This log is the exact feed dr-drift-monitor's RestoreTestLog expects — this framework PROVES restorability; that one TRENDS it over time.
